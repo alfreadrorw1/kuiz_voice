@@ -26,8 +26,8 @@ const GAME_CONFIG = {
 
 // Admin Credentials
 const ADMIN_CREDENTIALS = {
-    'admin': 'admin123',
-    'developer': 'dev123'
+    'alfread': 'admin123',
+    'alfread': 'dev123'
 };
 
 // Default Categories
