@@ -25,7 +25,9 @@ let gameState = {
     roomQuestions: [],
     categories: [],
     gameStarted: false,
-    playersAnswered: new Set()
+    playersAnswered: new Set(),
+    isQuestionLoaded: false,
+    lastQuestionIndex: -1
 };
 
 // Room State
@@ -35,7 +37,8 @@ let roomState = {
     gameStarted: false,
     currentQuestion: 0,
     status: 'waiting',
-    answers: {}
+    answers: {},
+    questionData: null
 };
 
 // UI State
@@ -43,7 +46,8 @@ let uiState = {
     isSoundEnabled: true,
     isVoiceChatEnabled: false,
     activeRoomType: null,
-    autoNextQuestion: false
+    autoNextQuestion: false,
+    isWaitingForNextQuestion: false
 };
 
 // DOM Elements Cache
@@ -524,6 +528,8 @@ function logout() {
     gameState.playersAnswered.clear();
     gameState.hasAnswered = false;
     gameState.allPlayersAnswered = false;
+    gameState.isQuestionLoaded = false;
+    gameState.lastQuestionIndex = -1;
     
     localStorage.removeItem('tebakmulti_user');
     showScreen('auth');
@@ -1346,6 +1352,8 @@ async function createRoom() {
             gameStarted: false,
             currentQuestion: 0,
             currentAnswers: {},
+            questionData: null,
+            questionEndTime: null,
             createdAt: firebase.database.ServerValue.TIMESTAMP,
             lastActivity: firebase.database.ServerValue.TIMESTAMP
         };
@@ -1506,7 +1514,7 @@ function setupRoomListener(roomCode) {
                 startGameFromRoom();
             }
         } else if (gameState.currentScreen === 'game') {
-            updateGameState(roomData);
+            updateGameStateFromRoom(roomData);
         }
     });
 }
@@ -1601,6 +1609,9 @@ async function startGame() {
         // Load questions for category
         await loadQuestionsForCategory(roomState.category);
         
+        // Get first question
+        const firstQuestion = gameState.roomQuestions[0];
+        
         // Update room status
         const roomRef = window.firebaseConfig.database.ref('rooms/' + roomState.code);
         await roomRef.update({
@@ -1608,7 +1619,10 @@ async function startGame() {
             currentQuestion: 0,
             status: 'playing',
             startedAt: firebase.database.ServerValue.TIMESTAMP,
-            currentAnswers: {}
+            currentAnswers: {},
+            questionData: firstQuestion,
+            questionStartTime: Date.now(),
+            questionEndTime: Date.now() + (window.firebaseConfig.GAME_CONFIG.QUESTION_TIME * 1000)
         });
         
         // Mute voice chat during game
@@ -1636,9 +1650,11 @@ function startGameFromRoom() {
     gameState.hasAnswered = false;
     gameState.allPlayersAnswered = false;
     gameState.playersAnswered.clear();
+    gameState.isQuestionLoaded = false;
+    gameState.lastQuestionIndex = -1;
     
     showScreen('game');
-    loadQuestion(0);
+    loadCurrentQuestion();
 }
 
 // Leave waiting room
@@ -1686,7 +1702,10 @@ async function leaveWaitingRoom() {
         gameState.playersAnswered.clear();
         gameState.hasAnswered = false;
         gameState.allPlayersAnswered = false;
+        gameState.isQuestionLoaded = false;
+        gameState.lastQuestionIndex = -1;
         uiState.isVoiceChatEnabled = false;
+        uiState.isWaitingForNextQuestion = false;
         
         showScreen('lobby');
         
@@ -1796,7 +1815,7 @@ async function toggleVoiceChat() {
 }
 
 // ===============================
-// GAME FUNCTIONS - FIXED BUGS
+// GAME FUNCTIONS - PERBAIKAN BUG
 // ===============================
 
 // Load questions for category
@@ -1827,31 +1846,44 @@ async function loadQuestionsForCategory(category) {
     }
 }
 
-// Load question
-function loadQuestion(index) {
+// Load current question from room state
+function loadCurrentQuestion() {
+    if (!roomState.code || !roomState.gameStarted) return;
+    
+    const currentIndex = roomState.currentQuestion || 0;
+    
+    // Prevent loading same question multiple times
+    if (gameState.isQuestionLoaded && gameState.lastQuestionIndex === currentIndex) {
+        return;
+    }
+    
+    // Clear previous question state
+    gameState.hasAnswered = false;
+    gameState.playersAnswered.clear();
+    gameState.timer = window.firebaseConfig.GAME_CONFIG.QUESTION_TIME;
+    gameState.isQuestionLoaded = true;
+    gameState.lastQuestionIndex = currentIndex;
+    
+    // Stop any existing timer
+    clearInterval(gameState.timerInterval);
+    
+    // Check if we have questions
     if (!gameState.roomQuestions || gameState.roomQuestions.length === 0) {
         showToast('Tidak ada soal tersedia!');
         return;
     }
     
-    if (index >= gameState.roomQuestions.length) {
+    // Check if game is over
+    if (currentIndex >= gameState.roomQuestions.length) {
         endGame();
         return;
     }
     
-    const question = gameState.roomQuestions[index];
-    gameState.currentQuestionIndex = index;
-    gameState.hasAnswered = false;
-    gameState.allPlayersAnswered = false;
-    gameState.timer = window.firebaseConfig.GAME_CONFIG.QUESTION_TIME;
-    gameState.playersAnswered.clear();
-    
-    // Reset auto next question flag
-    uiState.autoNextQuestion = false;
+    const question = gameState.roomQuestions[currentIndex];
     
     // Update UI
     domElements.game.questionText.textContent = question.text;
-    domElements.game.questionCounter.textContent = `${index + 1}/${gameState.roomQuestions.length}`;
+    domElements.game.questionCounter.textContent = `${currentIndex + 1}/${gameState.roomQuestions.length}`;
     
     // Update category
     const category = gameState.categories.find(cat => cat.id === roomState.category);
@@ -1870,7 +1902,7 @@ function loadQuestion(index) {
         optionElement.className = 'btn-secondary';
         optionElement.style.marginBottom = '10px';
         optionElement.textContent = option;
-        optionElement.onclick = () => submitAnswer(option, question.correctAnswer, index);
+        optionElement.onclick = () => submitAnswer(option, question.correctAnswer, currentIndex);
         domElements.game.optionsContainer.appendChild(optionElement);
     });
     
@@ -1883,14 +1915,17 @@ function loadQuestion(index) {
     // Start timer
     startTimer();
     updateGameScoreboard();
-    
-    // Update room current question
-    updateRoomQuestion(index);
 }
 
 // Start timer
 function startTimer() {
     clearInterval(gameState.timerInterval);
+    
+    // Calculate remaining time from server if available
+    if (roomState.questionEndTime) {
+        const remainingTime = Math.max(0, Math.floor((roomState.questionEndTime - Date.now()) / 1000));
+        gameState.timer = remainingTime > 0 ? remainingTime : window.firebaseConfig.GAME_CONFIG.QUESTION_TIME;
+    }
     
     gameState.timerInterval = setInterval(() => {
         gameState.timer--;
@@ -1907,12 +1942,22 @@ function startTimer() {
         if (gameState.timer <= 0) {
             clearInterval(gameState.timerInterval);
             
-            // Auto-advance to next question if not all players answered
-            if (!uiState.autoNextQuestion) {
-                uiState.autoNextQuestion = true;
-                setTimeout(() => {
-                    nextQuestion();
-                }, 2000);
+            // Disable all answer buttons
+            const buttons = domElements.game.optionsContainer.querySelectorAll('button');
+            buttons.forEach(button => {
+                button.disabled = true;
+                button.style.opacity = '0.5';
+            });
+            
+            // Auto-submit if not answered
+            if (!gameState.hasAnswered) {
+                submitAnswer(null, '', gameState.currentQuestionIndex);
+            }
+            
+            // Wait for all players or auto-advance
+            if (!uiState.isWaitingForNextQuestion) {
+                uiState.isWaitingForNextQuestion = true;
+                checkAllPlayersAnswered();
             }
         }
     }, 1000);
@@ -1920,25 +1965,50 @@ function startTimer() {
 
 // Submit answer
 async function submitAnswer(selectedAnswer, correctAnswer, questionIndex) {
-    if (gameState.hasAnswered || !roomState.code) return;
+    if (gameState.hasAnswered || !roomState.code || questionIndex !== roomState.currentQuestion) {
+        return;
+    }
     
     gameState.hasAnswered = true;
     gameState.playersAnswered.add(currentUser.id || currentUser.username);
     
     // Update player score
     let points = 0;
-    if (selectedAnswer === correctAnswer) {
+    let isCorrect = false;
+    
+    if (selectedAnswer && selectedAnswer === correctAnswer) {
         points = window.firebaseConfig.GAME_CONFIG.POINTS_CORRECT;
         // Bonus for fast answer
         if (gameState.timer > 5) {
             points += window.firebaseConfig.GAME_CONFIG.POINTS_FAST_BONUS;
         }
+        isCorrect = true;
         showToast(`Benar! +${points} poin`);
     } else if (selectedAnswer === null) {
         showToast('Waktu habis!');
     } else {
         showToast('Salah! Jawaban benar: ' + correctAnswer);
     }
+    
+    // Highlight correct/incorrect answers
+    const buttons = domElements.game.optionsContainer.querySelectorAll('button');
+    let correctButton = null;
+    
+    buttons.forEach(button => {
+        button.disabled = true;
+        if (button.textContent === correctAnswer) {
+            correctButton = button;
+            button.style.background = 'var(--gradient-success)';
+            button.style.color = 'white';
+            button.style.borderColor = 'var(--success)';
+        }
+        
+        if (selectedAnswer && button.textContent === selectedAnswer && selectedAnswer !== correctAnswer) {
+            button.style.background = 'var(--gradient-secondary)';
+            button.style.color = 'white';
+            button.style.borderColor = 'var(--danger)';
+        }
+    });
     
     // Update answer in room state
     try {
@@ -1955,41 +2025,27 @@ async function submitAnswer(selectedAnswer, correctAnswer, questionIndex) {
             
             // Record answer
             await roomRef.child(`currentAnswers/${playerId}`).set({
-                answer: selectedAnswer,
-                isCorrect: selectedAnswer === correctAnswer,
+                answer: selectedAnswer || 'timeout',
+                isCorrect: isCorrect,
                 points: points,
                 answeredAt: firebase.database.ServerValue.TIMESTAMP
             });
         }
+        
+        // Update game scoreboard
+        updateGameScoreboard();
+        
+        // Check if all players have answered
+        checkAllPlayersAnswered();
+        
     } catch (error) {
         console.error('Error updating answer:', error);
     }
-    
-    // Highlight correct/incorrect answers
-    const buttons = domElements.game.optionsContainer.querySelectorAll('button');
-    
-    buttons.forEach(button => {
-        button.disabled = true;
-        if (button.textContent === correctAnswer) {
-            button.style.background = 'var(--gradient-success)';
-            button.style.color = 'white';
-            button.style.borderColor = 'var(--success)';
-        } else if (button.textContent === selectedAnswer && selectedAnswer !== correctAnswer) {
-            button.style.background = 'var(--gradient-secondary)';
-            button.style.color = 'white';
-            button.style.borderColor = 'var(--danger)';
-        }
-    });
-    
-    updateGameScoreboard();
-    
-    // Check if all players have answered
-    checkAllPlayersAnswered();
 }
 
 // Check if all players have answered
 async function checkAllPlayersAnswered() {
-    if (!roomState.code || !roomState.players) return;
+    if (!roomState.code || !roomState.players || uiState.isWaitingForNextQuestion) return;
     
     try {
         const roomRef = window.firebaseConfig.database.ref('rooms/' + roomState.code);
@@ -2003,43 +2059,21 @@ async function checkAllPlayersAnswered() {
             // Count how many players have answered
             const answeredCount = Object.keys(currentAnswers || {}).length;
             
-            // If all players have answered, auto-advance after delay
-            if (answeredCount >= playerIds.length && !gameState.allPlayersAnswered) {
-                gameState.allPlayersAnswered = true;
+            console.log(`Players: ${playerIds.length}, Answered: ${answeredCount}`);
+            
+            // If all players have answered, advance to next question
+            if (answeredCount >= playerIds.length) {
+                uiState.isWaitingForNextQuestion = true;
                 clearInterval(gameState.timerInterval);
                 
-                showToast('Semua pemain telah menjawab!');
-                
-                // Auto-advance to next question
+                // Wait 3 seconds then go to next question
                 setTimeout(() => {
-                    if (!uiState.autoNextQuestion) {
-                        uiState.autoNextQuestion = true;
-                        nextQuestion();
-                    }
+                    nextQuestion();
                 }, 3000);
             }
         }
     } catch (error) {
         console.error('Error checking players answered:', error);
-    }
-}
-
-// Update room question
-async function updateRoomQuestion(questionIndex) {
-    if (!roomState.code) return;
-    
-    try {
-        const roomRef = window.firebaseConfig.database.ref('rooms/' + roomState.code);
-        
-        // Clear previous answers
-        await roomRef.child('currentAnswers').remove();
-        
-        // Update question index
-        await roomRef.update({
-            currentQuestion: questionIndex
-        });
-    } catch (error) {
-        console.error('Error updating room question:', error);
     }
 }
 
@@ -2087,14 +2121,21 @@ function updateGameScoreboard() {
 }
 
 // Update game state from room
-function updateGameState(roomData) {
-    // Update question if different
-    if (roomData.currentQuestion !== gameState.currentQuestionIndex && !gameState.hasAnswered) {
-        gameState.currentQuestionIndex = roomData.currentQuestion;
-        loadQuestion(roomData.currentQuestion);
+function updateGameStateFromRoom(roomData) {
+    // Update current question
+    const newQuestionIndex = roomData.currentQuestion || 0;
+    
+    // Only update if question changed
+    if (newQuestionIndex !== gameState.currentQuestionIndex) {
+        gameState.currentQuestionIndex = newQuestionIndex;
+        gameState.isQuestionLoaded = false;
+        gameState.hasAnswered = false;
+        gameState.playersAnswered.clear();
+        uiState.isWaitingForNextQuestion = false;
+        loadCurrentQuestion();
     }
     
-    // Check answers from other players
+    // Update answered players
     if (roomData.currentAnswers) {
         const currentAnswers = roomData.currentAnswers;
         const players = roomData.players || {};
@@ -2106,20 +2147,6 @@ function updateGameState(roomData) {
                 gameState.playersAnswered.add(player.userId || player.username);
             }
         });
-        
-        // Check if all players have answered
-        const playerIds = Object.keys(players);
-        if (Object.keys(currentAnswers).length >= playerIds.length && !gameState.allPlayersAnswered) {
-            gameState.allPlayersAnswered = true;
-            clearInterval(gameState.timerInterval);
-            
-            if (!uiState.autoNextQuestion) {
-                uiState.autoNextQuestion = true;
-                setTimeout(() => {
-                    nextQuestion();
-                }, 3000);
-            }
-        }
     }
     
     updateGameScoreboard();
@@ -2127,12 +2154,47 @@ function updateGameState(roomData) {
 
 // Next question
 async function nextQuestion() {
+    if (!roomState.code || uiState.autoNextQuestion) return;
+    
     const nextIndex = gameState.currentQuestionIndex + 1;
     
-    if (nextIndex < gameState.roomQuestions.length) {
-        loadQuestion(nextIndex);
-    } else {
+    // Check if game is over
+    if (nextIndex >= gameState.roomQuestions.length) {
         endGame();
+        return;
+    }
+    
+    // Get next question
+    const nextQuestion = gameState.roomQuestions[nextIndex];
+    
+    try {
+        const roomRef = window.firebaseConfig.database.ref('rooms/' + roomState.code);
+        
+        // Update room with next question
+        await roomRef.update({
+            currentQuestion: nextIndex,
+            currentAnswers: {},
+            questionData: nextQuestion,
+            questionStartTime: Date.now(),
+            questionEndTime: Date.now() + (window.firebaseConfig.GAME_CONFIG.QUESTION_TIME * 1000)
+        });
+        
+        // Update local state
+        gameState.currentQuestionIndex = nextIndex;
+        gameState.isQuestionLoaded = false;
+        gameState.hasAnswered = false;
+        gameState.allPlayersAnswered = false;
+        gameState.playersAnswered.clear();
+        gameState.timer = window.firebaseConfig.GAME_CONFIG.QUESTION_TIME;
+        uiState.isWaitingForNextQuestion = false;
+        uiState.autoNextQuestion = false;
+        
+        // Load new question
+        loadCurrentQuestion();
+        
+    } catch (error) {
+        console.error('Error moving to next question:', error);
+        showToast('Gagal memuat soal berikutnya');
     }
 }
 
@@ -2230,8 +2292,11 @@ async function endGame() {
         gameState.playersAnswered.clear();
         gameState.hasAnswered = false;
         gameState.allPlayersAnswered = false;
+        gameState.isQuestionLoaded = false;
+        gameState.lastQuestionIndex = -1;
         uiState.isVoiceChatEnabled = false;
         uiState.autoNextQuestion = false;
+        uiState.isWaitingForNextQuestion = false;
         
         showToast('Game selesai!');
         
